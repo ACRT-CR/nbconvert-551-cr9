@@ -6,16 +6,23 @@ one format to another.
 # Distributed under the terms of the Modified BSD License.
 
 import base64
+import errno
 import io
 import os
 import sys
 import subprocess
+import warnings
 
 from ipython_genutils.py3compat import cast_unicode_py2
 from testpath.tempdir import TemporaryDirectory
 from traitlets import Unicode, default
 
 from .convertfigures import ConvertFiguresPreprocessor
+
+if sys.version_info >= (3,3):
+    from shutil import which
+else:
+    from ipython_genutils.py3compat import which
 
 
 INKSCAPE_APP = '/Applications/Inkscape.app/Contents/Resources/bin/inkscape'
@@ -52,24 +59,57 @@ class SVG2PDFPreprocessor(ConvertFiguresPreprocessor):
 
     @default('command')
     def _command_default(self):
-        return self.inkscape + \
+        return '"%s"' % self.inkscape + \
                ' --without-gui --export-pdf="{to_filename}" "{from_filename}"'
     
     inkscape = Unicode(help="The path to Inkscape, if necessary").tag(config=True)
     @default('inkscape')
     def _inkscape_default(self):
-        if sys.platform == "darwin":
-            if os.path.isfile(INKSCAPE_APP):
-                return INKSCAPE_APP
+        # Prefer the registered executable over a PATH search on Windows.
         if sys.platform == "win32":
             wr_handle = winreg.ConnectRegistry(None, winreg.HKEY_LOCAL_MACHINE)
             try:
                 rkey = winreg.OpenKey(wr_handle, "SOFTWARE\\Classes\\inkscape.svg\\DefaultIcon")
-                inkscape = winreg.QueryValueEx(rkey, "")[0]
-            except FileNotFoundError:
-                raise FileNotFoundError("Inkscape executable not found")
-            return inkscape
-        return "inkscape"
+                inkscape = winreg.QueryValueEx(rkey, "")[0].split(",")[0]
+                if os.path.isfile(inkscape):
+                    return inkscape
+            except (OSError, IndexError):
+                pass
+
+        # Prevent implicit current-directory executable searches (CVE-2025-53000).
+        os.environ["NODEFAULTCURRENTDIRECTORYINEXEPATH"] = "1"
+        inkscape_path = which('inkscape')
+
+        # Older Windows which() implementations ignore the environment setting.
+        if sys.platform == "win32" and inkscape_path and sys.version_info < (3, 12):
+            try:
+                cwd = os.path.normcase(os.path.realpath(os.getcwd()))
+                in_cwd = os.path.normcase(
+                    os.path.dirname(os.path.realpath(inkscape_path))) == cwd
+                cwd_on_path = cwd in {
+                    os.path.normcase(os.path.realpath(p))
+                    for p in os.environ.get("PATH", os.defpath).split(os.pathsep)
+                }
+                if in_cwd and not cwd_on_path:
+                    warnings.warn(
+                        "shutil.which('inkscape') resolved to an executable in the current "
+                        "working directory even though CWD is not on PATH. Ignoring this "
+                        "result for security reasons (CVE-2025-53000).",
+                        RuntimeWarning,
+                        stacklevel=2,
+                    )
+                    inkscape_path = None
+            except Exception:
+                # Fail closed if the safety check cannot be completed.
+                inkscape_path = None
+
+        if inkscape_path is not None:
+            return inkscape_path
+        if sys.platform == "darwin":
+            if os.path.isfile(INKSCAPE_APP):
+                return INKSCAPE_APP
+
+        raise OSError(errno.ENOENT, "Inkscape executable not found in safe paths")
 
 
     def convert_figure(self, data_format, data):
